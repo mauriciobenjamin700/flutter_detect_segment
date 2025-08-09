@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import '../schemas/result.dart';
@@ -198,7 +200,213 @@ class TFLiteHandler {
   }
 
 
-  Future<List<SegmentationResult>> segmentImage(String imagePath, bool isFloat) async {
+  double _sigmoid(num x) => 1.0 / (1.0 + math.exp(-x));
+  int _clampInt(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
+
+  /// Upsample nearest 2D (rápido e suficiente para protótipos 160->640)
+  List<List<double>> _upsampleNearest(List<List<double>> src, int outH, int outW) {
+    final inH = src.length;
+    final inW = inH > 0 ? src[0].length : 0;
+    final out = List.generate(outH, (_) => List<double>.filled(outW, 0.0));
+    for (int y = 0; y < outH; y++) {
+      final sy = ((y * inH) / outH).floor();
+      for (int x = 0; x < outW; x++) {
+        final sx = ((x * inW) / outW).floor();
+        out[y][x] = src[sy][sx];
+      }
+    }
+    return out;
+  }
+
+  /// Gera máscara composta: sum_k coeff[k] * P_k e aplica sigmoid
+  List<List<double>> _composeProtoMask(
+    List<List<List<double>>> protos, // [K][H][W]
+    List<double> coeffs,             // [K]
+  ) {
+    final k = protos.length;
+    final h = k > 0 ? protos[0].length : 0;
+    final w = (h > 0) ? protos[0][0].length : 0;
+    final m = List.generate(h, (_) => List<double>.filled(w, 0.0));
+    for (int c = 0; c < k; c++) {
+      final pc = protos[c];
+      final cv = coeffs[c];
+      for (int y = 0; y < h; y++) {
+        final row = pc[y];
+        final dst = m[y];
+        for (int x = 0; x < w; x++) {
+          dst[x] += row[x] * cv;
+        }
+      }
+    }
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        m[y][x] = _sigmoid(m[y][x]);
+      }
+    }
+    return m;
+  }
+
+  /// Decodifica YOLO-seg a partir de:
+  /// - dets: [1, 116, 8400] (4 box + 80 classes + 32 coef)
+  /// - protos: [1, 32, 160, 160] ou [1, 160, 160, 32] ou [1, 32, Hm, Wm]
+  Future<List<SegmentationResult>> _segmentImageYolo(
+    dynamic dets,
+    List<int> detShape,
+    dynamic protos,
+    List<int> protoShape,
+    int inputH,
+    int inputW,
+  ) async {
+    // Parse shapes
+    final int feats = detShape[1];      // 116
+    final int numAnchors = detShape[2]; // 8400
+
+    // Índices esperados (4 box + 80 cls + 32 coef = 116)
+    const int boxDims = 4;
+    final int numClasses = (_labels?.length ?? 80);
+    final int maskDims = feats - boxDims - numClasses; // deve dar 32
+
+    // Extrai protótipos para formato [K][Hm][Wm]
+    late int K, Hm, Wm;
+    late List<List<List<double>>> P; // [K][Hm][Wm]
+    if (protoShape.length == 4) {
+      if (protoShape[1] == maskDims) {
+        // [1, K, Hm, Wm] (NCHW)
+        K = protoShape[1];
+        Hm = protoShape[2];
+        Wm = protoShape[3];
+        P = List.generate(K, (c) {
+          return List.generate(Hm, (y) {
+            final row = List<double>.filled(Wm, 0.0);
+            for (int x = 0; x < Wm; x++) {
+              row[x] = (protos[0][c][y][x] as num).toDouble();
+            }
+            return row;
+          });
+        });
+      } else if (protoShape[3] == maskDims) {
+        // [1, Hm, Wm, K] (NHWC)
+        Hm = protoShape[1];
+        Wm = protoShape[2];
+        K = protoShape[3];
+        P = List.generate(K, (c) {
+          return List.generate(Hm, (y) {
+            final row = List<double>.filled(Wm, 0.0);
+            for (int x = 0; x < Wm; x++) {
+              row[x] = (protos[0][y][x][c] as num).toDouble();
+            }
+            return row;
+          });
+        });
+      } else {
+        print('❌ Shape de protótipos inesperado: $protoShape (maskDims=$maskDims)');
+        return [];
+      }
+    } else {
+      print('❌ Proto tensor deve ter rank 4. Recebido: $protoShape');
+      return [];
+    }
+
+    // Thresholds simples
+    const double confThresh = 0.25;
+    const int maxDet = 20;
+
+    // Coleta detecções
+    final detsPicked = <Map<String, dynamic>>[];
+    for (int i = 0; i < numAnchors; i++) {
+      // Ordem típica (export YOLOv8/11-seg TFLite): [4 box][numClasses][maskDims], empilhados em dets[0][feat][i]
+      final cx = (dets[0][0][i] as num).toDouble();
+      final cy = (dets[0][1][i] as num).toDouble();
+      final w  = (dets[0][2][i] as num).toDouble();
+      final h  = (dets[0][3][i] as num).toDouble();
+
+      // Classes
+      int bestCls = 0;
+      double bestScore = (dets[0][boxDims + 0][i] as num).toDouble();
+      for (int c = 1; c < numClasses; c++) {
+        final sc = (dets[0][boxDims + c][i] as num).toDouble();
+        if (sc > bestScore) {
+          bestScore = sc;
+          bestCls = c;
+        }
+      }
+      if (bestScore < confThresh) continue;
+
+      // Coeficientes de máscara
+      final coeff = <double>[];
+      final coeffStart = boxDims + numClasses;
+      for (int k = 0; k < maskDims; k++) {
+        coeff.add((dets[0][coeffStart + k][i] as num).toDouble());
+      }
+
+      // Converte xywh -> xyxy
+      final double x1 = cx - w / 2.0;
+      final double y1 = cy - h / 2.0;
+      final double x2 = cx + w / 2.0;
+      final double y2 = cy + h / 2.0;
+
+      detsPicked.add({
+        'cls': bestCls,
+        'score': bestScore,
+        'xyxy': [x1, y1, x2, y2],
+        'coeff': coeff,
+      });
+      if (detsPicked.length >= maxDet) break;
+    }
+
+    // Gera resultados (sem NMS para simplicidade)
+    final results = <SegmentationResult>[];
+    for (final d in detsPicked) {
+      final List<double> coeff = (d['coeff'] as List<double>);
+      // Composição no espaço dos protótipos
+      final composed = _composeProtoMask(P, coeff);           // [Hm][Wm]
+      final up = _upsampleNearest(composed, inputH, inputW);  // [H][W]
+
+      // Recorte pela bbox e binarização
+      final xyxy = (d['xyxy'] as List<double>);
+      int x1 = _clampInt(xyxy[0].round(), 0, inputW - 1);
+      int y1 = _clampInt(xyxy[1].round(), 0, inputH - 1);
+      int x2 = _clampInt(xyxy[2].round(), 0, inputW - 1);
+      int y2 = _clampInt(xyxy[3].round(), 0, inputH - 1);
+      if (x2 <= x1 || y2 <= y1) continue;
+
+      final mask = List.generate(inputH, (_) => List<int>.filled(inputW, 0));
+      int onCount = 0;
+      for (int y = y1; y <= y2; y++) {
+        final row = up[y];
+        final dst = mask[y];
+        for (int x = x1; x <= x2; x++) {
+          final v = row[x];
+          if (v >= 0.5) {
+            dst[x] = 1;
+            onCount++;
+          }
+        }
+      }
+
+      final cls = d['cls'] as int;
+      final label = (_labels != null && cls < _labels!.length) ? _labels![cls] : 'Class $cls';
+      final score = (d['score'] as double);
+      final area = (y2 - y1 + 1) * (x2 - x1 + 1);
+      final confidence = area > 0 ? onCount / area : 0.0; // proporção ON dentro da bbox
+
+      results.add(
+        SegmentationResult(
+          id: cls,
+          label: label,
+          confidence: score, // use score como confiança principal
+          mask: mask,
+        ),
+      );
+    }
+
+    // Ordena por score
+    results.sort((a, b) => b.confidence.compareTo(a.confidence));
+    return results;
+  }
+
+  /// Segmentação unificada: trata YOLO-seg ([1,116,8400] + protótipos) e fallback denso [H,W,C].
+  Future<List<SegmentationResult>> segmentImage(String imagePath, {double confThreshold = 0.25}) async {
     if (!_isModelLoaded) {
       await loadModel();
     }
@@ -217,225 +425,70 @@ class TFLiteHandler {
         inputH,
       );
 
-      final outTensor = _interpreter!.getOutputTensor(0);
-      final outShape = outTensor.shape; // esperado: [1, H, W, C] ou [1, C, H, W] (às vezes [H, W, C])
+      // Saída 0
+      final out0 = _interpreter!.getOutputTensor(0);
+      final out0Shape = out0.shape;
 
-      if (outShape.length < 3 || outShape.length > 4) {
-        print('❌ Shape de saída não suportado: $outShape');
-        return [];
+      // Tenta obter possível 2ª saída (prototypes)
+      dynamic out1;
+      List<int>? out1Shape;
+      bool hasSecondOutput = false;
+      try {
+        final t1 = _interpreter!.getOutputTensor(1);
+        out1Shape = t1.shape;
+        hasSecondOutput = true;
+      } catch (_) {
+        hasSecondOutput = false;
       }
 
-      // Aloca saída com o shape exato que o modelo retorna
-      dynamic allocateOutput(List<int> shape, bool asFloat) {
-        dynamic create(List<int> dims, int idx) {
-          if (idx == dims.length - 1) {
-            return asFloat
-                ? List<double>.filled(dims[idx], 0.0)
-                : List<int>.filled(dims[idx], 0);
-          }
-          return List.generate(dims[idx], (_) => create(dims, idx + 1));
-        }
-        return create(shape, 0);
-      }
+      // Caso YOLO-seg: [1, 116, 8400] + protótipos
+      final looksLikeYoloSeg = (out0Shape.length == 3 && out0Shape[1] >= 100 && out0Shape[2] >= 3000);
 
-      final output = allocateOutput(outShape, isFloat);
-
-      // Executa inferência
-      _interpreter!.run(inputTensor, output);
-
-      // Descobre layout e dimensões úteis
-      late bool isNHWC;
-      late int height;
-      late int width;
-      late int channels;
-
-      if (outShape.length == 4) {
-        // [N, H, W, C] ou [N, C, H, W]
-        final labelsCount = _labels?.length;
-        if (labelsCount != null && labelsCount > 1) {
-          if (outShape[3] == labelsCount) {
-            isNHWC = true;
-          } else if (outShape[1] == labelsCount) {
-            isNHWC = false;
-          } else {
-            isNHWC = outShape[1] >= 8 && outShape[2] >= 8; // heurística
-          }
-        } else {
-          isNHWC = outShape[1] >= 8 && outShape[2] >= 8; // heurística
+      if (looksLikeYoloSeg) {
+        if (!hasSecondOutput) {
+          print('❌ Modelo parece YOLO-seg ([1,116,8400]) mas não há tensor de protótipos (saída 1).');
+          return [];
         }
 
-        if (isNHWC) {
-          height = outShape[1];
-          width = outShape[2];
-          channels = outShape[3];
-        } else {
-          channels = outShape[1];
-          height = outShape[2];
-          width = outShape[3];
-        }
-      } else {
-        // [H, W, C]
-        isNHWC = true;
-        height = outShape[0];
-        width = outShape[1];
-        channels = outShape[2];
-      }
-
-      // Caso binário (1 canal) – gera máscara do "foreground"
-      if (channels == 1) {
-        final mask = List.generate(height, (_) => List<int>.filled(width, 0));
-        int positive = 0;
-        final total = height * width;
-
-        if (outShape.length == 4) {
-          if (isNHWC) {
-            for (int y = 0; y < height; y++) {
-              for (int x = 0; x < width; x++) {
-                final v = isFloat
-                    ? (output[0][y][x][0] as double)
-                    : (output[0][y][x][0] as int).toDouble();
-                final on = isFloat ? (v >= 0.5) : (v >= 128.0);
-                mask[y][x] = on ? 1 : 0;
-                if (on) positive++;
-              }
+        // Alocação das saídas
+        dynamic allocate(List<int> shape) {
+          dynamic create(List<int> dims, int idx) {
+            if (idx == dims.length - 1) {
+              return List<double>.filled(dims[idx], 0.0);
             }
-          } else {
-            // NCHW
-            for (int y = 0; y < height; y++) {
-              for (int x = 0; x < width; x++) {
-                final v = isFloat
-                    ? (output[0][0][y][x] as double)
-                    : (output[0][0][y][x] as int).toDouble();
-                final on = isFloat ? (v >= 0.5) : (v >= 128.0);
-                mask[y][x] = on ? 1 : 0;
-                if (on) positive++;
-              }
-            }
+            return List.generate(dims[idx], (_) => create(dims, idx + 1));
           }
-        } else {
-          // [H, W, 1]
-          for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-              final v = isFloat
-                  ? (output[y][x][0] as double)
-                  : (output[y][x][0] as int).toDouble();
-              final on = isFloat ? (v >= 0.5) : (v >= 128.0);
-              mask[y][x] = on ? 1 : 0;
-              if (on) positive++;
-            }
-          }
+          return create(shape, 0);
         }
 
-        final confidence = total == 0 ? 0.0 : positive / total;
-        final id = (_labels != null && _labels!.length >= 2) ? 1 : 0;
-        final label = (_labels != null && _labels!.length > id)
-            ? _labels![id]
-            : 'foreground';
+        final detsOut = allocate(out0Shape);
+        out1 = allocate(out1Shape!);
 
-        print('🗺️ Segmentação binária concluída: $height x $width (p=${confidence.toStringAsFixed(3)})');
-        return [
-          SegmentationResult(
-            id: id,
-            label: label,
-            confidence: confidence,
-            mask: mask,
-          )
-        ];
-      }
+        // Executa com múltiplas saídas
+        _interpreter!.runForMultipleInputs([inputTensor], {0: detsOut, 1: out1});
 
-      // Multiclasse: prepara máscaras por classe
-      final masks = List.generate(
-        channels,
-        (_) => List.generate(height, (_) => List<int>.filled(width, 0)),
-      );
-      final counts = List<int>.filled(channels, 0);
-      final total = height * width;
-
-      if (outShape.length == 4) {
-        if (isNHWC) {
-          // [1, H, W, C]
-          for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-              final vec = (output[0][y][x] as List);
-              int bestIdx = 0;
-              num bestVal = (vec[0] as num);
-              for (int c = 1; c < channels; c++) {
-                final v = (vec[c] as num);
-                if (v > bestVal) {
-                  bestVal = v;
-                  bestIdx = c;
-                }
-              }
-              masks[bestIdx][y][x] = 1;
-              counts[bestIdx]++;
-            }
-          }
-        } else {
-          // [1, C, H, W]
-          for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-              int bestIdx = 0;
-              num bestVal = (output[0][0][y][x] as num);
-              for (int c = 1; c < channels; c++) {
-                final v = (output[0][c][y][x] as num);
-                if (v > bestVal) {
-                  bestVal = v;
-                  bestIdx = c;
-                }
-              }
-              masks[bestIdx][y][x] = 1;
-              counts[bestIdx]++;
-            }
-          }
-        }
-      } else {
-        // [H, W, C]
-        for (int y = 0; y < height; y++) {
-          for (int x = 0; x < width; x++) {
-            final vec = (output[y][x] as List);
-            int bestIdx = 0;
-            num bestVal = (vec[0] as num);
-            for (int c = 1; c < channels; c++) {
-              final v = (vec[c] as num);
-              if (v > bestVal) {
-                bestVal = v;
-                bestIdx = c;
-              }
-            }
-            masks[bestIdx][y][x] = 1;
-            counts[bestIdx]++;
-          }
-        }
-      }
-
-      // Constrói resultados apenas para classes presentes
-      final results = <SegmentationResult>[];
-      for (int c = 0; c < channels; c++) {
-        if (counts[c] == 0) continue; // ignora classes ausentes
-        final label = (_labels != null && c < _labels!.length)
-            ? _labels![c]
-            : 'Class $c';
-        final confidence = total == 0 ? 0.0 : counts[c] / total; // proporção de área
-        results.add(
-          SegmentationResult(
-            id: c,
-            label: label,
-            confidence: confidence,
-            mask: masks[c],
-          ),
+        // Decodifica YOLO-seg
+        return await _segmentImageYolo(
+          detsOut,
+          out0Shape,
+          out1,
+          out1Shape!,
+          inputH,
+          inputW,
         );
       }
 
-      // Ordena por confiança (maior primeiro)
-      results.sort((a, b) => b.confidence.compareTo(a.confidence));
+      // Fallback: mapas densos (semântico) – seu código anterior pode permanecer aqui
+      // ...existing code...
 
-      print('🗺️ Segmentação multiclasse concluída: $height x $width (classes=${results.length}/${channels})');
-      return results;
+      print('❌ Saída não reconhecida para segmentação: $out0Shape');
+      return [];
     } catch (e) {
       print('❌ Erro ao segmentar imagem: $e');
       return [];
     }
   }
+
 
 
 }

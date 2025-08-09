@@ -14,7 +14,7 @@ class ImageSegmentationService {
 
     await tflite.loadModel();
 
-    final output = await tflite.segmentImage(imagePath, true);
+    final output = await tflite.segmentImage(imagePath);
 
     for (var result in output) {
       print('🔍 Resultado da segmentação: ${result.toString()}');
