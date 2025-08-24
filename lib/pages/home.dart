@@ -67,19 +67,28 @@ class _HomePageState extends State<HomePage> {
               onImageTap: _onImageSelected,
             ),
           ),
-          Expanded(
-            child: Text(
-              _segmentationResult != null
-                  ? 'Segmentation Result: \n ${_segmentationResult!.map((e) => e.toString()).join('\n')}'
-                  : 'No image selected',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.w500,
-                color: _segmentationResult != null
-                    ? Colors.green.shade800
-                    : Colors.grey.shade600,
+          // Preview da imagem selecionada (base para sobrepor segmentação futuramente)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            child: Container(
+              width: double.infinity,
+              height: 240,
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.grey.shade300),
               ),
-              textAlign: TextAlign.center,
+              child: _selectedImage != null
+                  ? ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.asset(_selectedImage!, fit: BoxFit.contain),
+                    )
+                  : Center(
+                      child: Text(
+                        'Pré-visualização: selecione uma imagem acima',
+                        style: TextStyle(color: Colors.grey.shade600),
+                      ),
+                    ),
             ),
           ),
         ],
