@@ -1,9 +1,9 @@
-class PredictionResult {
+class ClassificationResult {
   final int id;
   final String label;
   final double confidence;
 
-  PredictionResult({
+  ClassificationResult({
     required this.id,
     required this.label,
     required this.confidence,
@@ -11,7 +11,7 @@ class PredictionResult {
 
   @override
   String toString() {
-    return 'PredictionResult(id: $id, confidence: $confidence, label: $label)';
+    return 'ClassificationResult(id: $id, confidence: $confidence, label: $label)';
   }
 }
 
@@ -28,16 +28,18 @@ class SegmentationResult {
   final String label;
   final double confidence;
   final List<List<int>> mask;
+  final List<List<int>>? boundingBoxes; // [[x1,y1,x2,y2], [x1,y1,x2,y2],...]
 
   SegmentationResult({
     required this.id,
     required this.label,
     required this.confidence,
     required this.mask,
+    required this.boundingBoxes
   });
 
   @override
   String toString() {
-    return 'SegmentationResult(id: $id, label: $label, confidence: $confidence, mask: $mask)';
+    return 'SegmentationResult(id: $id, label: $label, confidence: $confidence, mask: $mask , boundingBoxes: $boundingBoxes)';
   }
 }

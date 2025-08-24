@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import '../core/constants.dart';
-import '../schemas/result.dart';
 import '../services/image_segmentation.dart';
 import '../widgets/image_gallery.dart';
 
@@ -13,17 +12,19 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   String? _selectedImage;
-  List<SegmentationResult>? _segmentationResult;
+  List<List<double>>? _segmentationResult;
   final _imageSegmentationService = ImageSegmentationService();
 
   Future<void> _onImageSelected(String ImagePath) async {
     setState(() {
       _selectedImage = ImagePath;
     });
-    final result = await _imageSegmentationService.segmentImage(ImagePath);
-    setState(() {
-      _segmentationResult = result;
-    });
+    await _imageSegmentationService.segmentImage(ImagePath);
+
+    // final result = await _imageSegmentationService.segmentImage(ImagePath);
+    // setState(() {
+    //   _segmentationResult = result;
+    // });
   }
 
   @override
@@ -69,7 +70,7 @@ class _HomePageState extends State<HomePage> {
           Expanded(
             child: Text(
               _segmentationResult != null
-                  ? 'Segmentation Result: \n ${_segmentationResult?.map((e) => e.label).join(", ")}'
+                  ? 'Segmentation Result: \n ${_segmentationResult!.map((e) => e.toString()).join('\n')}'
                   : 'No image selected',
               style: TextStyle(
                 fontSize: 16,
