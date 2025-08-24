@@ -104,7 +104,6 @@ class TFLiteHandler {
     }
   }
 
-
   /// Segmenta uma imagem usando o modelo carregado.
   /// **1**: Representa o batch size (processamento de uma única imagem por vez).
   /// **feats**: Número de atributos por detecção. Geralmente inclui:
@@ -123,10 +122,123 @@ class TFLiteHandler {
 
     try {
       debugPrint('🔍 Iniciando segmentação para: $imagePath');
+      if (_interpreter == null) {
+        debugPrint('❌ Interpretador TFLite não inicializado');
+        return;
+      }
 
+      // 1) Metadados de entrada
+      final inTensor = _interpreter!.getInputTensor(0);
+      final inShape = inTensor.shape; // esperado [1, H, W, C]
+      final inputH = inShape.length > 2 ? inShape[1] : 0;
+      final inputW = inShape.length > 2 ? inShape[2] : 0;
+      final inputC = inShape.length > 3 ? inShape[3] : 0;
+      debugPrint('📥 Input[0] shape=$inShape type=${inTensor.type}');
+
+      // 2) Pré-processamento (usa seu helper existente)
+      final inputTensor = await ImageHandler.imageToTensor(
+        imagePath,
+        inputW,
+        inputH,
+      );
+      debugPrint(
+        '🧪 Input tensor pronto (C=$inputC) -> tipo=${inputTensor.runtimeType}',
+      );
+
+      // 3) Descobrir todas as saídas disponíveis
+      final outputShapes = <int, List<int>>{};
+      final outputTypes = <int, Object>{};
+      int outIndex = 0;
+      while (true) {
+        try {
+          final t = _interpreter!.getOutputTensor(outIndex);
+          outputShapes[outIndex] = t.shape;
+          outputTypes[outIndex] = t.type;
+          outIndex++;
+        } catch (_) {
+          break;
+        }
+      }
+      if (outputShapes.isEmpty) {
+        debugPrint('❌ Nenhuma saída encontrada no modelo');
+        return;
+      }
+      for (final i in outputShapes.keys) {
+        debugPrint(
+          '📤 Output[$i] shape=${outputShapes[i]} type=${outputTypes[i]}',
+        );
+      }
+
+      // 4) Alocar objetos de saída conforme os shapes
+      final outputs = <int, dynamic>{};
+      outputShapes.forEach((i, shape) {
+        outputs[i] = allocateOutput(shape);
+      });
+
+      // 5) Executar inferência (múltiplas saídas se houver)
+      if (outputs.length == 1) {
+        final onlyOut = outputs.values.first;
+        _interpreter!.run(inputTensor, onlyOut);
+        debugPrint('✅ run() concluído');
+      } else {
+        _interpreter!.runForMultipleInputs([
+          inputTensor,
+        ], outputs.map((k, v) => MapEntry(k, v)));
+        debugPrint(
+          '✅ runForMultipleInputs() concluído (${outputs.length} saídas)',
+        );
+      }
+
+      // 6) Debug print de todas as saídas (shape + valores)
+      const maxElementsToPrint = 100; // limite para não travar o log
+      for (final i in outputs.keys.toList()..sort()) {
+        final data = outputs[i];
+        final shape = outputShapes[i]!;
+        debugPrint('=== 🔎 Dump Output[$i] (shape=$shape) ===');
+        final flat = _flattenToNumList(data);
+        _printFlatList(flat, maxElements: maxElementsToPrint);
+        if (flat.length > maxElementsToPrint) {
+          debugPrint(
+            '... (${flat.length - maxElementsToPrint} valores não impressos)',
+          );
+        }
+      }
+
+      // 7) Fim
+      debugPrint('🏁 Segmentação concluída (debug de saídas impresso).');
     } catch (e) {
       print('❌ Erro ao segmentar imagem: $e');
       return;
     }
+  }
+
+  // Auxiliares de debug
+  List<num> _flattenToNumList(dynamic data) {
+    final out = <num>[];
+    void walk(dynamic x) {
+      if (x is List) {
+        for (final v in x) {
+          walk(v);
+        }
+      } else if (x is num) {
+        out.add(x);
+      } else {
+        // ignora tipos não numéricos
+      }
+    }
+
+    walk(data);
+    return out;
+  }
+
+  void _printFlatList(List<num> list, {int maxElements = 8000}) {
+    final n = math.min(list.length, maxElements);
+    final buf = StringBuffer();
+    for (int i = 0; i < n; i++) {
+      buf.write(list[i]);
+      if (i + 1 < n) buf.write(', ');
+      if ((i + 1) % 64 == 0) buf.writeln();
+    }
+    debugPrint(buf.toString());
   }
 }
