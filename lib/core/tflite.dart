@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
@@ -32,7 +33,9 @@ class TFLiteHandler {
         return;
       }
 
-      _isolateInterpreter = await IsolateInterpreter.create(address: _interpreter!.address);
+      _isolateInterpreter = await IsolateInterpreter.create(
+        address: _interpreter!.address,
+      );
 
       final labelsData = await rootBundle.loadString(labelsPath);
       _labels = labelsData
@@ -268,16 +271,35 @@ class TFLiteHandler {
           int saved = 0;
           for (int i = 0; i < anchors; i++) {
             // Caixa: cx, cy, w, h
-            final cx = (dets[0][0][i] as num).toDouble();
-            final cy = (dets[0][1][i] as num).toDouble();
-            final w = (dets[0][2][i] as num).toDouble();
-            final h = (dets[0][3][i] as num).toDouble();
+            double cx = (dets[0][0][i] as num).toDouble();
+            double cy = (dets[0][1][i] as num).toDouble();
+            double w = (dets[0][2][i] as num).toDouble();
+            double h = (dets[0][3][i] as num).toDouble();
+
+            // Alguns exports retornam caixas normalizadas [0,1]; autoescala se parecer o caso
+            final maxBoxVal = [
+              cx.abs(),
+              cy.abs(),
+              w.abs(),
+              h.abs(),
+            ].reduce(math.max);
+            final boxesLikelyNormalized = maxBoxVal <= 1.5; // margem p/ ruído
+            if (boxesLikelyNormalized) {
+              cx *= inputW;
+              w *= inputW;
+              cy *= inputH;
+              h *= inputH;
+            }
 
             // Classe + score (pega a melhor)
             int bestCls = 0;
-            double bestScore = (dets[0][boxDims + 0][i] as num).toDouble();
+            // Aplica sigmoid nos logits de classe (YOLO v8-seg exporta logits)
+            double bestScore = _sigmoid(
+              (dets[0][boxDims + 0][i] as num).toDouble(),
+            );
             for (int c = 1; c < numClasses; c++) {
-              final sc = (dets[0][boxDims + c][i] as num).toDouble();
+              final raw = (dets[0][boxDims + c][i] as num).toDouble();
+              final sc = _sigmoid(raw);
               if (sc > bestScore) {
                 bestScore = sc;
                 bestCls = c;
@@ -301,17 +323,18 @@ class TFLiteHandler {
 
             // Composição -> upsample -> binarização
             final composed = _composeProtoMask(P, coeff); // [Hm][Wm]
-            final up = _upsampleNearest(composed, inputH, inputW); // [H][W]
+            final up = _upsampleBilinear(composed, inputH, inputW); // [H][W]
             final mask = List.generate(
               inputH,
               (_) => List<int>.filled(inputW, 0),
             );
             int on = 0;
+            const maskBinThreshold = 0.30; // menor para evitar tudo preto
             for (int y = y1; y <= y2; y++) {
               final srcRow = up[y];
               final dstRow = mask[y];
               for (int x = x1; x <= x2; x++) {
-                if (srcRow[x] >= 0.5) {
+                if (srcRow[x] >= maskBinThreshold) {
                   dstRow[x] = 255; // branco
                   on++;
                 }
@@ -322,9 +345,23 @@ class TFLiteHandler {
             final label = (_labels != null && bestCls < _labels!.length)
                 ? _labels![bestCls]
                 : 'class_$bestCls';
-            final path = await _saveMaskAsPng(mask, suffix: label);
+            // Estatísticas para diagnosticar máscaras pretas
+            double localMin = double.infinity;
+            double localMax = -double.infinity;
+            for (int y = y1; y <= y2; y++) {
+              final row = up[y];
+              for (int x = x1; x <= x2; x++) {
+                final v = row[x];
+                if (v < localMin) localMin = v;
+                if (v > localMax) localMax = v;
+              }
+            }
             debugPrint(
-              '💾 Máscara salva em: $path (label=$label, conf=${bestScore.toStringAsFixed(3)})',
+              '🧩 det#$i label=$label conf=${bestScore.toStringAsFixed(3)} box=${x1},${y1},${x2},${y2} normBoxes=$boxesLikelyNormalized onPixels=$on local[min=${localMin.toStringAsFixed(3)}, max=${localMax.toStringAsFixed(3)}]',
+            );
+            final path = await _saveCutoutAsPng(imagePath, mask, suffix: label);
+            debugPrint(
+              '💾 Imagem segmentada salva em: $path (label=$label, conf=${bestScore.toStringAsFixed(3)})',
             );
             saved++;
             if (bestScore > bestMaskScore) {
@@ -417,45 +454,87 @@ class TFLiteHandler {
     return out;
   }
 
-  List<List<double>> _upsampleNearest(
+  List<List<double>> _upsampleBilinear(
     List<List<double>> src,
     int outH,
     int outW,
   ) {
     final inH = src.length;
     final inW = inH > 0 ? src[0].length : 0;
-    if (inH == 0 || inW == 0)
+    if (inH == 0 || inW == 0) {
       return List.generate(outH, (_) => List<double>.filled(outW, 0.0));
+    }
     final out = List.generate(outH, (_) => List<double>.filled(outW, 0.0));
+    final scaleY = (inH - 1) / (outH - 1);
+    final scaleX = (inW - 1) / (outW - 1);
     for (int y = 0; y < outH; y++) {
-      final sy = ((y * inH) / outH).floor();
+      final fy = y * scaleY;
+      final y0 = fy.floor();
+      final y1 = math.min(y0 + 1, inH - 1);
+      final wy = fy - y0;
       for (int x = 0; x < outW; x++) {
-        final sx = ((x * inW) / outW).floor();
-        out[y][x] = src[sy][sx];
+        final fx = x * scaleX;
+        final x0 = fx.floor();
+        final x1 = math.min(x0 + 1, inW - 1);
+        final wx = fx - x0;
+
+        final v00 = src[y0][x0];
+        final v01 = src[y0][x1];
+        final v10 = src[y1][x0];
+        final v11 = src[y1][x1];
+
+        final v0 = v00 * (1 - wx) + v01 * wx;
+        final v1 = v10 * (1 - wx) + v11 * wx;
+        out[y][x] = v0 * (1 - wy) + v1 * wy;
       }
     }
     return out;
   }
 
-  Future<String> _saveMaskAsPng(
+  Future<String> _saveCutoutAsPng(
+    String originalPath,
     List<List<int>> mask, {
-    String suffix = 'mask',
+    String suffix = 'seg',
   }) async {
+    // Carrega imagem original (asset ou arquivo)
+    Uint8List bytes;
+    if (originalPath.startsWith('assets/')) {
+      final data = await rootBundle.load(originalPath);
+      bytes = data.buffer.asUint8List();
+    } else {
+      bytes = await File(originalPath).readAsBytes();
+    }
+    final orig = img.decodeImage(bytes);
+    if (orig == null) {
+      throw Exception('decodeImage falhou para $originalPath');
+    }
+
+    // Ajusta tamanho para bater com a máscara (inferida no input do modelo)
     final h = mask.length;
     final w = h > 0 ? mask[0].length : 0;
-    final image = img.Image(width: w, height: h);
+    final base = (orig.width != w || orig.height != h)
+        ? img.copyResize(orig, width: w, height: h)
+        : orig;
+
+    // Constrói imagem recortada com fundo transparente
+    final cut = img.Image(width: w, height: h);
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
-        final v = mask[y][x].clamp(0, 255);
-        image.setPixelRgba(x, y, v, v, v, 255);
+        if (mask[y][x] != 0) {
+          final px = base.getPixel(x, y);
+          cut.setPixelRgba(x, y, px.r, px.g, px.b, 255);
+        } else {
+          cut.setPixelRgba(x, y, 0, 0, 0, 0);
+        }
       }
     }
-    final bytes = img.encodePng(image);
+
+    final outBytes = img.encodePng(cut);
     final dir = Directory.systemTemp;
     final file = File(
-      '${dir.path}/seg_mask_${suffix}_${DateTime.now().millisecondsSinceEpoch}.png',
+      '${dir.path}/seg_cutout_${suffix}_${DateTime.now().millisecondsSinceEpoch}.png',
     );
-    await file.writeAsBytes(bytes, flush: true);
+    await file.writeAsBytes(outBytes, flush: true);
     return file.path;
   }
 }
