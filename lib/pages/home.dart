@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'dart:io';
 import '../core/constants.dart';
 import '../services/image_segmentation.dart';
 import '../widgets/image_gallery.dart';
@@ -15,11 +16,21 @@ class _HomePageState extends State<HomePage> {
   List<List<double>>? _segmentationResult;
   final _imageSegmentationService = ImageSegmentationService();
 
-  Future<void> _onImageSelected(String ImagePath) async {
+  Future<void> _onImageSelected(String imagePath) async {
+    // Atualiza imediatamente com a imagem selecionada da galeria
     setState(() {
-      _selectedImage = ImagePath;
+      _selectedImage = imagePath;
     });
-    await _imageSegmentationService.segmentImage(ImagePath);
+
+    // Após a segmentação, atualiza com o caminho da melhor máscara (se houver)
+    final bestMaskPath = await _imageSegmentationService.segmentImage(
+      imagePath,
+    );
+    if (bestMaskPath != null) {
+      setState(() {
+        _selectedImage = bestMaskPath;
+      });
+    }
 
     // final result = await _imageSegmentationService.segmentImage(ImagePath);
     // setState(() {
@@ -81,7 +92,12 @@ class _HomePageState extends State<HomePage> {
               child: _selectedImage != null
                   ? ClipRRect(
                       borderRadius: BorderRadius.circular(8),
-                      child: Image.asset(_selectedImage!, fit: BoxFit.contain),
+                      child: _selectedImage!.startsWith('assets/')
+                          ? Image.asset(_selectedImage!, fit: BoxFit.contain)
+                          : Image.file(
+                              File(_selectedImage!),
+                              fit: BoxFit.contain,
+                            ),
                     )
                   : Center(
                       child: Text(

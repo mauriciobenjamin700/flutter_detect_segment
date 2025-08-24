@@ -1,8 +1,9 @@
 import 'dart:math' as math;
+import 'dart:io';
+import 'package:image/image.dart' as img;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
-import '../schemas/result.dart';
 import './image_handler.dart';
 
 /// Classe responsável pelo gerenciamento e execução de modelos TensorFlow Lite
@@ -11,6 +12,7 @@ class TFLiteHandler {
   final String labelsPath;
 
   Interpreter? _interpreter;
+  IsolateInterpreter? _isolateInterpreter;
   List<String>? _labels;
   bool _isModelLoaded = false;
 
@@ -29,6 +31,8 @@ class TFLiteHandler {
         print('❌ Erro ao inicializar o interpretador');
         return;
       }
+
+      _isolateInterpreter = await IsolateInterpreter.create(address: _interpreter!.address);
 
       final labelsData = await rootBundle.loadString(labelsPath);
       _labels = labelsData
@@ -91,7 +95,7 @@ class TFLiteHandler {
       final outShape = _interpreter!.getOutputTensor(0).shape;
       final output = allocateOutput(outShape);
 
-      _interpreter!.run(inputTensor, output);
+      await _isolateInterpreter!.run(inputTensor, output);
 
       // assume output shape [1, N]
       final probs = (output is List && output.isNotEmpty)
@@ -114,9 +118,9 @@ class TFLiteHandler {
   /// **anchors**: Número total de detecções (ou "anchors") que o modelo processa. Exemplo: 8400 anchors.
   /// **K**: Número de protótipos (ou dimensões latentes) usados para compor as máscaras de segmentação. Exemplo: 32.
   /// Hm e Wm: Altura e largura do mapa de protótipos (geralmente menor que a resolução da imagem de entrada, ex.: 160x160).
-  Future<void> segmentImage(
+  Future<String?> segmentImage(
     String imagePath, {
-    double confThreshold = 0.25,
+    double confThreshold = 0.2,
   }) async {
     if (!_isModelLoaded) await loadModel();
 
@@ -124,7 +128,7 @@ class TFLiteHandler {
       debugPrint('🔍 Iniciando segmentação para: $imagePath');
       if (_interpreter == null) {
         debugPrint('❌ Interpretador TFLite não inicializado');
-        return;
+        return null;
       }
 
       // 1) Metadados de entrada
@@ -161,7 +165,7 @@ class TFLiteHandler {
       }
       if (outputShapes.isEmpty) {
         debugPrint('❌ Nenhuma saída encontrada no modelo');
-        return;
+        return null;
       }
       for (final i in outputShapes.keys) {
         debugPrint(
@@ -178,10 +182,10 @@ class TFLiteHandler {
       // 5) Executar inferência (múltiplas saídas se houver)
       if (outputs.length == 1) {
         final onlyOut = outputs.values.first;
-        _interpreter!.run(inputTensor, onlyOut);
+        await _isolateInterpreter!.run(inputTensor, onlyOut);
         debugPrint('✅ run() concluído');
       } else {
-        _interpreter!.runForMultipleInputs([
+        await _isolateInterpreter!.runForMultipleInputs([
           inputTensor,
         ], outputs.map((k, v) => MapEntry(k, v)));
         debugPrint(
@@ -190,7 +194,7 @@ class TFLiteHandler {
       }
 
       // 6) Debug print de todas as saídas (shape + valores)
-      const maxElementsToPrint = 100; // limite para não travar o log
+      const maxElementsToPrint = 1; // limite para não travar o log
       for (final i in outputs.keys.toList()..sort()) {
         final data = outputs[i];
         final shape = outputShapes[i]!;
@@ -204,11 +208,152 @@ class TFLiteHandler {
         }
       }
 
-      // 7) Fim
-      debugPrint('🏁 Segmentação concluída (debug de saídas impresso).');
+      // 7) Tenta extrair máscaras (YOLO-seg: out0 [1,116,anchors], out1 [1,Hm,Wm,32] ou [1,32,Hm,Wm])
+      String? bestMaskPath;
+      double bestMaskScore = -1.0;
+      if (outputShapes.length >= 2) {
+        final detShape = outputShapes[0]!;
+        final protoShape = outputShapes[1]!;
+        final isYoloSeg =
+            detShape.length == 3 && detShape[1] >= 100 && detShape[2] >= 1000;
+        if (isYoloSeg) {
+          final dets = outputs[0];
+          final protos = outputs[1];
+
+          final feats = detShape[1];
+          final anchors = detShape[2];
+          final numClasses = _labels?.length ?? 80;
+          const boxDims = 4;
+          final maskDims = feats - boxDims - numClasses; // ex.: 32
+
+          // Extrai protótipos no formato [K][Hm][Wm]
+          late int K, Hm, Wm;
+          late List<List<List<double>>> P;
+          if (protoShape.length == 4 && protoShape[3] == maskDims) {
+            // NHWC [1,Hm,Wm,K]
+            Hm = protoShape[1];
+            Wm = protoShape[2];
+            K = protoShape[3];
+            P = List.generate(K, (c) {
+              return List.generate(Hm, (y) {
+                return List.generate(
+                  Wm,
+                  (x) => (protos[0][y][x][c] as num).toDouble(),
+                );
+              });
+            });
+          } else if (protoShape.length == 4 && protoShape[1] == maskDims) {
+            // NCHW [1,K,Hm,Wm]
+            K = protoShape[1];
+            Hm = protoShape[2];
+            Wm = protoShape[3];
+            P = List.generate(K, (c) {
+              return List.generate(Hm, (y) {
+                return List.generate(
+                  Wm,
+                  (x) => (protos[0][c][y][x] as num).toDouble(),
+                );
+              });
+            });
+          } else {
+            debugPrint(
+              '⚠️ Formato de protótipos não suportado: $protoShape (maskDims=$maskDims)',
+            );
+            debugPrint('🏁 Segmentação concluída (sem extração de máscara).');
+            return null;
+          }
+
+          // Itera detecções, compõe e salva algumas máscaras
+          const maxToSave = 5;
+          int saved = 0;
+          for (int i = 0; i < anchors; i++) {
+            // Caixa: cx, cy, w, h
+            final cx = (dets[0][0][i] as num).toDouble();
+            final cy = (dets[0][1][i] as num).toDouble();
+            final w = (dets[0][2][i] as num).toDouble();
+            final h = (dets[0][3][i] as num).toDouble();
+
+            // Classe + score (pega a melhor)
+            int bestCls = 0;
+            double bestScore = (dets[0][boxDims + 0][i] as num).toDouble();
+            for (int c = 1; c < numClasses; c++) {
+              final sc = (dets[0][boxDims + c][i] as num).toDouble();
+              if (sc > bestScore) {
+                bestScore = sc;
+                bestCls = c;
+              }
+            }
+            if (bestScore < confThreshold) continue;
+
+            // Coeficientes da máscara
+            final coeff = <double>[];
+            final coeffStart = boxDims + numClasses;
+            for (int k = 0; k < maskDims; k++) {
+              coeff.add((dets[0][coeffStart + k][i] as num).toDouble());
+            }
+
+            // BBox em xyxy
+            final x1 = (cx - w / 2.0).round().clamp(0, inputW - 1);
+            final y1 = (cy - h / 2.0).round().clamp(0, inputH - 1);
+            final x2 = (cx + w / 2.0).round().clamp(0, inputW - 1);
+            final y2 = (cy + h / 2.0).round().clamp(0, inputH - 1);
+            if (x2 <= x1 || y2 <= y1) continue;
+
+            // Composição -> upsample -> binarização
+            final composed = _composeProtoMask(P, coeff); // [Hm][Wm]
+            final up = _upsampleNearest(composed, inputH, inputW); // [H][W]
+            final mask = List.generate(
+              inputH,
+              (_) => List<int>.filled(inputW, 0),
+            );
+            int on = 0;
+            for (int y = y1; y <= y2; y++) {
+              final srcRow = up[y];
+              final dstRow = mask[y];
+              for (int x = x1; x <= x2; x++) {
+                if (srcRow[x] >= 0.5) {
+                  dstRow[x] = 255; // branco
+                  on++;
+                }
+              }
+            }
+            if (on == 0) continue;
+
+            final label = (_labels != null && bestCls < _labels!.length)
+                ? _labels![bestCls]
+                : 'class_$bestCls';
+            final path = await _saveMaskAsPng(mask, suffix: label);
+            debugPrint(
+              '💾 Máscara salva em: $path (label=$label, conf=${bestScore.toStringAsFixed(3)})',
+            );
+            saved++;
+            if (bestScore > bestMaskScore) {
+              bestMaskScore = bestScore;
+              bestMaskPath = path;
+            }
+            if (saved >= maxToSave) break;
+          }
+          if (saved == 0) {
+            debugPrint(
+              'ℹ️ Nenhuma máscara acima do limiar conf=${confThreshold.toStringAsFixed(2)}',
+            );
+          }
+        }
+      }
+
+      // 8) Fim
+      debugPrint(
+        '🏁 Segmentação concluída (debug + tentativa de salvar máscaras).',
+      );
+      if (bestMaskPath != null) {
+        debugPrint(
+          '⭐ Melhor máscara: $bestMaskPath (score=${bestMaskScore.toStringAsFixed(3)})',
+        );
+      }
+      return bestMaskPath;
     } catch (e) {
       print('❌ Erro ao segmentar imagem: $e');
-      return;
+      return null;
     }
   }
 
@@ -240,5 +385,77 @@ class TFLiteHandler {
       if ((i + 1) % 64 == 0) buf.writeln();
     }
     debugPrint(buf.toString());
+  }
+
+  // ===== Helpers para compor/upsample e salvar PNG =====
+  double _sigmoid(num x) => 1.0 / (1.0 + math.exp(-x));
+
+  List<List<double>> _composeProtoMask(
+    List<List<List<double>>> protos,
+    List<double> coeffs,
+  ) {
+    final K = protos.length;
+    final H = K > 0 ? protos[0].length : 0;
+    final W = (H > 0) ? protos[0][0].length : 0;
+    final out = List.generate(H, (_) => List<double>.filled(W, 0.0));
+    for (int k = 0; k < K; k++) {
+      final pk = protos[k];
+      final ck = coeffs[k];
+      for (int y = 0; y < H; y++) {
+        final src = pk[y];
+        final dst = out[y];
+        for (int x = 0; x < W; x++) {
+          dst[x] += src[x] * ck;
+        }
+      }
+    }
+    for (int y = 0; y < out.length; y++) {
+      for (int x = 0; x < out[y].length; x++) {
+        out[y][x] = _sigmoid(out[y][x]);
+      }
+    }
+    return out;
+  }
+
+  List<List<double>> _upsampleNearest(
+    List<List<double>> src,
+    int outH,
+    int outW,
+  ) {
+    final inH = src.length;
+    final inW = inH > 0 ? src[0].length : 0;
+    if (inH == 0 || inW == 0)
+      return List.generate(outH, (_) => List<double>.filled(outW, 0.0));
+    final out = List.generate(outH, (_) => List<double>.filled(outW, 0.0));
+    for (int y = 0; y < outH; y++) {
+      final sy = ((y * inH) / outH).floor();
+      for (int x = 0; x < outW; x++) {
+        final sx = ((x * inW) / outW).floor();
+        out[y][x] = src[sy][sx];
+      }
+    }
+    return out;
+  }
+
+  Future<String> _saveMaskAsPng(
+    List<List<int>> mask, {
+    String suffix = 'mask',
+  }) async {
+    final h = mask.length;
+    final w = h > 0 ? mask[0].length : 0;
+    final image = img.Image(width: w, height: h);
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        final v = mask[y][x].clamp(0, 255);
+        image.setPixelRgba(x, y, v, v, v, 255);
+      }
+    }
+    final bytes = img.encodePng(image);
+    final dir = Directory.systemTemp;
+    final file = File(
+      '${dir.path}/seg_mask_${suffix}_${DateTime.now().millisecondsSinceEpoch}.png',
+    );
+    await file.writeAsBytes(bytes, flush: true);
+    return file.path;
   }
 }
